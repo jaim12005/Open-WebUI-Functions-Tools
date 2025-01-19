@@ -1,7 +1,7 @@
 """
 title: Anthropic API Integration for OpenWebUI
 author: Balaxxe
-version: 2.1
+version: 2.2
 license: MIT
 requirements: pydantic>=2.0.0, requests>=2.0.0
 environment_variables: 
@@ -47,6 +47,7 @@ class Pipe:
     MAX_PDF_SIZE = 32 * 1024 * 1024
     TOTAL_MAX_IMAGE_SIZE = 100 * 1024 * 1024
     PDF_BETA_HEADER = "pdfs-2024-09-25"
+    FUNCTION_BETA_HEADER = "function-calling-2023-09-25"
     # TODO: Fetch model max tokens from the API if available
     MODEL_MAX_TOKENS = {
         "claude-3-opus-20240229": 4096,
@@ -74,6 +75,7 @@ class Pipe:
         self.id = "anthropic"
         self.valves = self.Valves()
         self.request_id = None
+        self.default_stop_sequences = ["\n\nHuman:", "<|end-of-output|>"]
 
     def get_anthropic_models(self) -> List[dict]:
         return [
@@ -199,6 +201,11 @@ class Pipe:
             model_name = body["model"].split("/")[-1]
             max_tokens_limit = self.MODEL_MAX_TOKENS.get(model_name, 4096)
 
+            stop_param = body.get("stop", None)
+            stop_sequences = stop_param if isinstance(stop_param, list) else []
+            if not stop_sequences:
+                stop_sequences = self.default_stop_sequences
+
             payload = {
                 "model": model_name,
                 "messages": self._process_messages(messages),
@@ -218,18 +225,16 @@ class Pipe:
                 ),
                 "stream": body.get("stream"),
                 "metadata": body.get("metadata", {}),
+                "stop": stop_sequences
             }
-
-            payload = {k: v for k, v in payload.items() if v is not None}
 
             if system_message:
                 payload["system"] = str(system_message)
 
             if "tools" in body:
-                payload["tools"] = [
-                    {"type": "function", "function": tool} for tool in body["tools"]
-                ]
-                payload["tool_choice"] = body.get("tool_choice")
+                payload["tools"] = body["tools"]
+                if "tool_choice" in body:
+                    payload["tool_choice"] = body["tool_choice"]
 
             if "response_format" in body:
                 payload["response_format"] = {
@@ -243,26 +248,9 @@ class Pipe:
             }
 
             beta_headers = []
-            if any(
-                isinstance(msg["content"], list)
-                and any(
-                    item.get("type") == "pdf_url" or item.get("cache_control")
-                    for item in msg["content"]
-                )
-                for msg in body.get("messages", [])
-            ):
-                if any(
-                    isinstance(msg["content"], list)
-                    and any(item.get("type") == "pdf_url" for item in msg["content"])
-                    for msg in body.get("messages", [])
-                ):
-                    beta_headers.append(self.PDF_BETA_HEADER)
-                if any(
-                    isinstance(msg["content"], list)
-                    and any(item.get("cache_control") for item in msg["content"])
-                    for msg in body.get("messages", [])
-                ):
-                    beta_headers.append(self.BETA_HEADER)
+            if any(isinstance(m["content"], list) for m in body["messages"]):
+                if "tools" in body:
+                    beta_headers.append(self.FUNCTION_BETA_HEADER)
 
             if beta_headers:
                 headers["anthropic-beta"] = ",".join(beta_headers)
