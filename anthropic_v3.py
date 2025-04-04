@@ -1,7 +1,7 @@
 """
 title: Anthropic API Integration for OpenWebUI
 author: Balaxxe
-version: 3.2
+version: 3.3
 license: MIT
 requirements: pydantic>=2.0.0, requests>=2.0.0, fastapi>=0.95.0
 
@@ -18,11 +18,12 @@ features:
   - Streaming responses for real-time output
   - Advanced function calling / Tool use with OpenAI compatibility
   - Extended thinking capability for Claude 3.7 models with event notifications
-  - 128k context window support for Claude 3.7 models
+  - 200k context window support for Claude 3.7 models
+  - Extended output capability with up to 128K tokens for supported models
   - Configurable prompt caching for improved performance and reduced token usage
   - JSON response format for structured data
   - Detailed metadata and token usage tracking
-  - Configurable temperature, max tokens, and stop sequences
+  - Configurable temperature, max output tokens, and stop sequences
   - Robust error handling and automatic retries
   - Comprehensive logging for debugging
   - Event-based notifications for thinking, token usage, and completion
@@ -32,14 +33,14 @@ environment_variables:
     - ANTHROPIC_API_VERSION (optional): API version to use (defaults to 2023-06-01)
     - ANTHROPIC_RETRY_COUNT (optional): Number of retries for rate limits (defaults to 3)
     - ANTHROPIC_TIMEOUT (optional): Request timeout in seconds (defaults to 60)
-    - ANTHROPIC_ENABLE_LARGE_CONTEXT (optional): Enable 128k context for Claude 3.7 (true/false)
     - ANTHROPIC_DEFAULT_MODEL (optional): Default model to use
-    - ANTHROPIC_DEFAULT_MAX_TOKENS (optional): Default max tokens to use
+    - ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS (optional): Default max output tokens to use (e.g., 4096)
     - ANTHROPIC_DEFAULT_TEMPERATURE (optional): Default temperature
     - ANTHROPIC_THINKING_ENABLED (optional): Enable thinking by default
-    - ANTHROPIC_THINKING_BUDGET (optional): Default thinking budget tokens
+    - ANTHROPIC_THINKING_BUDGET (optional): Default thinking budget tokens (min 1024, must be < max_output_tokens)
     - ANTHROPIC_DEFAULT_STOP_SEQUENCES (optional): Default stop sequences
     - ANTHROPIC_ENABLE_PROMPT_CACHING (optional): Enable prompt caching (defaults to true)
+    - ANTHROPIC_ENABLE_EXTENDED_OUTPUT (optional): Enable extended output (128K tokens) for supported models
     - ANTHROPIC_RESPONSE_FORMAT_JSON (optional): Request responses in JSON format (defaults to false)
     - ANTHROPIC_CACHE_CONTROL (optional): Cache control strategy (standard, aggressive, minimal)
     - ANTHROPIC_ENABLE_TOOL_USE (optional): Enable function calling/tool use capabilities (defaults to true)
@@ -49,10 +50,10 @@ usage: |
   1. Set your Anthropic API key in the valves configuration
   2. Configure parameters as needed in OpenWebUI:
      - Default Model: Recommended "claude-3-7-sonnet-latest"
-     - Max Tokens: Controls maximum response length
+     - Max Output Tokens: Controls maximum response length (default 4096)
      - Thinking Enabled: For deep reasoning (Claude 3.7 only)
-     - Thinking Budget: Token allocation for thinking (20,000+ recommended for complex tasks)
-     - Enable Large Context: Set to true for 128k context with Claude 3.7
+     - Thinking Budget: Token allocation for thinking (default 4096, min 1024, automatically capped below Max Output Tokens)
+     - Enable Extended Output: Set to true for 128K max output tokens (Claude 3.7 Sonnet only)
      - Enable Prompt Caching: Set to true for improved performance (default)
      - Response Format JSON: Set to true to request responses in JSON format
      - Cache Control: Choose caching strategy (standard, aggressive, minimal)
@@ -64,7 +65,8 @@ usage: |
   - PDF support is only available for specific models (Claude 3.5 and 3.7)
   - For multimodal use, simply upload images in the chat interface
   - Stop sequences are only applied when explicitly requested
-  - Large context (128k) is only available for Claude 3.7 models
+  - Context window for all models is 200k tokens
+  - Extended output (128K tokens) is available only for Claude 3.7 Sonnet with the extended-output beta feature
   - JSON response format ensures responses are valid JSON (useful for structured data)
   - Tool use supports both Anthropic's native format and OpenAI-compatible function calling
   - Response metadata includes token usage, stop reason, and other useful information
@@ -87,13 +89,13 @@ from fastapi import Request
 Configurable Valves:
     - ANTHROPIC_API_KEY: Your Anthropic API key (required)
     - DEFAULT_MODEL: Default model to use (e.g., "claude-3-7-sonnet-latest")
-    - DEFAULT_MAX_TOKENS: Default token limit (e.g., 4096)
+    - DEFAULT_MAX_OUTPUT_TOKENS: Default max output tokens (e.g., 4096)
     - DEFAULT_TEMPERATURE: Default temperature between 0.0-1.0 (e.g., 0.7)
     - THINKING_ENABLED: Enable thinking by default for Claude 3.7+ models (true/false)
-    - THINKING_BUDGET: Default thinking budget tokens (min 1024, e.g., 2048)
+    - THINKING_BUDGET: Default thinking budget tokens (min 1024, e.g., 4096, will be capped below max_output_tokens)
     - DEFAULT_STOP_SEQUENCES: Default stop sequences (comma-separated strings)
-    - ENABLE_LARGE_CONTEXT: Enable 128k context for Claude 3.7 models (true/false)
     - ENABLE_PROMPT_CACHING: Enable prompt caching for improved performance (true/false)
+    - ENABLE_EXTENDED_OUTPUT: Enable extended output (128K tokens) for supported models (true/false)
     - RESPONSE_FORMAT_JSON: Request responses in JSON format (true/false)
     - CACHE_CONTROL: Cache control strategy (standard, aggressive, minimal)
     - ENABLE_TOOL_USE: Enable function calling/tool use capabilities (true/false)
@@ -117,12 +119,17 @@ class Pipe:
         "claude-3-5-sonnet-20240620",
         "claude-3-7-sonnet-20240620",
         "claude-3-7-sonnet-20250219",
+        "claude-3-7-sonnet-latest",
+    ]
+    EXTENDED_OUTPUT_MODEL_FAMILIES = [
+        "claude-3-7-sonnet",
     ]
     MAX_IMAGE_SIZE = 5 * 1024 * 1024
     MAX_PDF_SIZE = 32 * 1024 * 1024
     TOTAL_MAX_IMAGE_SIZE = 100 * 1024 * 1024
     PDF_BETA_HEADER = "pdfs-2024-09-25"
-    BETA_HEADER = "prompt-caching-2024-07-31"
+    PROMPT_CACHING_BETA_HEADER = "prompt-caching-2024-07-31"
+    EXTENDED_OUTPUT_BETA_HEADER = "output-128k-2025-02-19"
 
     class Valves(BaseModel):
         ANTHROPIC_API_KEY: str = Field(
@@ -133,9 +140,9 @@ class Pipe:
             default=os.getenv("ANTHROPIC_DEFAULT_MODEL", "claude-3-7-sonnet-latest"),
             description="Default model to use if not specified in request",
         )
-        DEFAULT_MAX_TOKENS: int = Field(
-            default=int(os.getenv("ANTHROPIC_DEFAULT_MAX_TOKENS", "4096")),
-            description="Default token limit if not specified in request",
+        DEFAULT_MAX_OUTPUT_TOKENS: int = Field(
+            default=int(os.getenv("ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS", "4096")),
+            description="Default max output tokens if not specified in request",
         )
         DEFAULT_TEMPERATURE: float = Field(
             default=float(os.getenv("ANTHROPIC_DEFAULT_TEMPERATURE", "0.7")),
@@ -146,8 +153,8 @@ class Pipe:
             description="Enable thinking by default for Claude 3.7+ models",
         )
         THINKING_BUDGET: int = Field(
-            default=int(os.getenv("ANTHROPIC_THINKING_BUDGET", "2048")),
-            description="Default thinking budget tokens (min 1024)",
+            default=int(os.getenv("ANTHROPIC_THINKING_BUDGET", "4096")),
+            description="Default thinking budget tokens (min 1024, automatically capped below max_output_tokens)",
         )
         DEFAULT_STOP_SEQUENCES: str = Field(
             default=os.getenv(
@@ -155,19 +162,16 @@ class Pipe:
             ),
             description="Default stop sequences (comma-separated)",
         )
-        ENABLE_LARGE_CONTEXT: bool = Field(
-            default=os.getenv("ANTHROPIC_ENABLE_LARGE_CONTEXT", "false").lower()
-            == "true",
-            description="Enable 128k context for Claude 3.7 models",
-        )
         ENABLE_PROMPT_CACHING: bool = Field(
-            default=os.getenv("ANTHROPIC_ENABLE_PROMPT_CACHING", "true").lower()
-            == "true",
+            default=os.getenv("ANTHROPIC_ENABLE_PROMPT_CACHING", "true").lower() == "true",
             description="Enable prompt caching for improved performance",
         )
+        ENABLE_EXTENDED_OUTPUT: bool = Field(
+            default=os.getenv("ANTHROPIC_ENABLE_EXTENDED_OUTPUT", "false").lower() == "true",
+            description="Enable extended output (128K tokens) for supported models",
+        )
         RESPONSE_FORMAT_JSON: bool = Field(
-            default=os.getenv("ANTHROPIC_RESPONSE_FORMAT_JSON", "false").lower()
-            == "true",
+            default=os.getenv("ANTHROPIC_RESPONSE_FORMAT_JSON", "false").lower() == "true",
             description="Request responses in JSON format",
         )
         CACHE_CONTROL: str = Field(
@@ -175,8 +179,7 @@ class Pipe:
             description="Cache control strategy (standard, aggressive, minimal)",
         )
         ENABLE_TOOL_USE: bool = Field(
-            default=os.getenv("ANTHROPIC_ENABLE_TOOL_USE", "true").lower()
-            == "true",
+            default=os.getenv("ANTHROPIC_ENABLE_TOOL_USE", "true").lower() == "true",
             description="Enable function calling/tool use capabilities",
         )
         TOOL_CHOICE: str = Field(
@@ -216,9 +219,6 @@ class Pipe:
             logging.info(
                 f"Initialized with default stop sequences: {self.default_stop_sequences}"
             )
-
-        if self.valves.ENABLE_LARGE_CONTEXT:
-            logging.info("Large context (128k) is enabled for Claude 3.7 models")
 
     def enable(self):
         """Enable the function"""
@@ -327,7 +327,6 @@ class Pipe:
                             except Exception as e:
                                 logging.error(f"Error processing streaming JSON data: {str(e)}")
                     
-                    # Validate and yield the complete JSON at the end
                     try:
                         json_obj = json.loads(json_content)
                         yield {"content": json_obj, "format": "json", "metadata": metadata}
@@ -533,14 +532,14 @@ class Pipe:
                                     "source": {"type": "url", "url": url},
                                 }
                             )
-                elif item.get("type") == "pdf_url":
+                elif item.get("type") in ["pdf_url", "document"]:
                     model_name = message.get("model", "").split("/")[-1]
                     if model_name in self.SUPPORTED_PDF_MODELS:
-                        if (
-                            isinstance(item.get("pdf_url"), dict)
-                            and "url" in item["pdf_url"]
-                        ):
-                            url = item["pdf_url"]["url"]
+                        url_key = "pdf_url" if item.get("type") == "pdf_url" else "url"
+                        data_source = item.get(item.get("type"))
+                        
+                        if isinstance(data_source, dict) and url_key in data_source:
+                            url = data_source[url_key]
                             if url.startswith("data:application/pdf"):
                                 try:
                                     mime_type, base64_data = url.split(",", 1)
@@ -565,6 +564,10 @@ class Pipe:
                                         "source": {"type": "url", "url": url},
                                     }
                                 )
+                        elif isinstance(data_source, dict) and "source" in data_source and data_source["source"].get("type") == "base64":
+                            processed_content.append(item)
+                        elif isinstance(data_source, dict) and "source" in data_source and data_source["source"].get("type") == "url":
+                            processed_content.append(item)
 
             processed_messages.append(
                 {"role": message["role"], "content": processed_content}
@@ -591,16 +594,16 @@ class Pipe:
             "claude-3-7-sonnet-latest",
         ]:
             context_length = 200000
-            if name.startswith("claude-3-7") and self.valves.ENABLE_LARGE_CONTEXT:
-                context_length = 128000
 
             supports_vision = "haiku" not in name or name != "claude-3-5-haiku-20241022"
-            supports_pdf = name in self.SUPPORTED_PDF_MODELS
-            supports_thinking = name in self.SUPPORTED_THINKING_MODELS
+            supports_pdf = name in self.SUPPORTED_PDF_MODELS or name.startswith("claude-3-7")
+            supports_thinking = name in self.SUPPORTED_THINKING_MODELS or name.startswith("claude-3-7")
             
             supports_tool_use = True
             
             supports_json = True
+            
+            supports_extended_output = self._supports_extended_output(name)
 
             display_name = f"Claude {name.replace('claude-', '')}"
 
@@ -614,9 +617,24 @@ class Pipe:
                     "supports_thinking": supports_thinking,
                     "supports_tool_use": supports_tool_use,
                     "supports_json": supports_json,
+                    "supports_extended_output": supports_extended_output,
                 }
             )
         return models
+
+    def _supports_extended_output(self, model_name: str) -> bool:
+        """Check if a model supports extended output by looking at its family name"""
+        supports = any(model_name.startswith(family) for family in self.EXTENDED_OUTPUT_MODEL_FAMILIES)
+        logging.info(f"Model {model_name} supports extended output: {supports}")
+        return supports
+
+    def _supports_thinking(self, model_name: str) -> bool:
+        """Check if a model supports extended thinking capabilities"""
+        supports = model_name in self.SUPPORTED_THINKING_MODELS or any(
+            model_name.startswith(family) for family in self.EXTENDED_OUTPUT_MODEL_FAMILIES
+        )
+        logging.info(f"Model {model_name} supports extended thinking: {supports}")
+        return supports
 
     async def pipe(
         self,
@@ -674,7 +692,42 @@ class Pipe:
                 logging.info(f"Using default model: {self.valves.DEFAULT_MODEL}")
 
             model_name = body["model"].split("/")[-1]
-            max_tokens_limit = 4096
+            logging.info(f"Processing request for model: {model_name}")
+            
+            default_max_tokens = self.valves.DEFAULT_MAX_OUTPUT_TOKENS
+            logging.info(f"Default max output tokens from valve: {default_max_tokens}")
+            
+            model_supports_extended_output = self._supports_extended_output(model_name)
+            model_supports_thinking = self._supports_thinking(model_name)
+            
+            logging.info(f"Extended output enabled in valves: {self.valves.ENABLE_EXTENDED_OUTPUT}")
+            logging.info(f"Thinking enabled in valves: {self.valves.THINKING_ENABLED}")
+            
+            if self.valves.ENABLE_EXTENDED_OUTPUT and not model_supports_extended_output:
+                logging.warning(f"Extended output is enabled but model {model_name} does not support it. Feature will be disabled.")
+                
+            if self.valves.THINKING_ENABLED and not model_supports_thinking:
+                logging.warning(f"Thinking is enabled but model {model_name} does not support it. Feature will be disabled.")
+            
+            if self.valves.ENABLE_EXTENDED_OUTPUT and model_supports_extended_output and not self.valves.THINKING_ENABLED:
+                max_tokens_limit = 128000
+                logging.info(f"Extended output enabled: Setting max tokens limit to 128000 (maximum capability, overriding user setting)")
+            elif self.valves.THINKING_ENABLED and model_supports_thinking:
+                max_tokens_limit = default_max_tokens
+                logging.info(f"Thinking mode: Using user-defined max tokens limit of {max_tokens_limit}")
+            else:
+                max_tokens_limit = min(default_max_tokens, 4096)
+                logging.info(f"Standard mode: Using max tokens limit of {max_tokens_limit}")
+                
+            requested_max_tokens = body.get("max_tokens", max_tokens_limit)
+            logging.info(f"Requested max_tokens: {requested_max_tokens}")
+            
+            if self.valves.ENABLE_EXTENDED_OUTPUT and model_supports_extended_output and not self.valves.THINKING_ENABLED:
+                final_max_tokens = 128000
+            else:
+                final_max_tokens = min(requested_max_tokens, max_tokens_limit)
+                
+            logging.info(f"Final max_tokens value: {final_max_tokens}")
 
             temperature = self.valves.DEFAULT_TEMPERATURE
             if "temperature" in body:
@@ -699,10 +752,7 @@ class Pipe:
                     if hasattr(self, "_process_messages")
                     else messages
                 ),
-                "max_tokens": min(
-                    body.get("max_tokens", self.valves.DEFAULT_MAX_TOKENS),
-                    max_tokens_limit,
-                ),
+                "max_tokens": final_max_tokens,
                 "temperature": temperature,
                 "stream": body.get("stream", True),
             }
@@ -725,19 +775,28 @@ class Pipe:
             if system_message:
                 payload["system"] = system_message
 
-            if model_name.startswith("claude-3-7"):
-                if self.valves.THINKING_ENABLED:
-                    thinking_budget = min(
-                        self.valves.THINKING_BUDGET, max_tokens_limit // 2
-                    )
-                    payload["thinking"] = {
-                        "type": "enabled",
-                        "budget_tokens": thinking_budget,
-                    }
-                    payload["temperature"] = 1.0
-                    logging.info(
-                        f"THINKING ENABLED: Using thinking with budget: {thinking_budget} tokens"
-                    )
+            if model_name.startswith("claude-3-7") and self.valves.THINKING_ENABLED and model_supports_thinking:
+                raw_thinking_budget = self.valves.THINKING_BUDGET
+                logging.info(f"Raw thinking budget from valve: {raw_thinking_budget}")
+                
+                thinking_budget = max(1024, raw_thinking_budget)
+                
+                if thinking_budget >= final_max_tokens:
+                    thinking_budget = final_max_tokens - 1
+                    logging.info(f"Thinking budget capped due to max_tokens constraint: {thinking_budget}")
+                else:
+                    logging.info(f"Using uncapped thinking budget: {thinking_budget}")
+                
+                payload["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": thinking_budget,
+                }
+                payload["temperature"] = 1.0
+                logging.info(
+                    f"THINKING ENABLED: Using thinking with budget: {thinking_budget} tokens"
+                )
+            elif self.valves.THINKING_ENABLED and not model_supports_thinking:
+                logging.warning(f"Thinking requested but model {model_name} does not support it - feature disabled")
 
             if self.default_stop_sequences:
                 payload["stop_sequences"] = self.default_stop_sequences
@@ -750,10 +809,26 @@ class Pipe:
 
             beta_headers = []
             
+            has_pdf = any(
+                item.get("type") in ["pdf_url", "document"]
+                for msg in messages
+                for item in msg.get("content", [])
+            )
+            
+            if has_pdf and model_name in self.SUPPORTED_PDF_MODELS:
+                beta_headers.append(self.PDF_BETA_HEADER)
+                logging.info("PDF processing enabled via beta header")
+
             if self.valves.ENABLE_PROMPT_CACHING:
-                beta_headers.append(self.BETA_HEADER)
+                beta_headers.append(self.PROMPT_CACHING_BETA_HEADER)
                 logging.info("Prompt caching enabled")
                 
+            if self.valves.ENABLE_EXTENDED_OUTPUT and model_supports_extended_output and not self.valves.THINKING_ENABLED:
+                beta_headers.append(self.EXTENDED_OUTPUT_BETA_HEADER)
+                logging.info("Extended output enabled via beta header")
+            elif self.valves.ENABLE_EXTENDED_OUTPUT and self.valves.THINKING_ENABLED:
+                logging.info("Extended output ignored because thinking is enabled - they cannot be used together")
+
             if self.valves.ENABLE_TOOL_USE:
                 if "tools" in body:
                     payload["tools"] = body["tools"]
@@ -796,6 +871,7 @@ class Pipe:
 
             if beta_headers:
                 headers["anthropic-beta"] = ",".join(beta_headers)
+                logging.info(f"Added beta headers: {headers['anthropic-beta']}")
 
             if payload.get("stream", True) and __event_emitter__:
                 return self._stream_response(
