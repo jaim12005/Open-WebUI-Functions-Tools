@@ -1,7 +1,7 @@
 """
 title: Anthropic API Integration for OpenWebUI
 author: Balaxxe
-version: 3.1
+version: 3.2
 license: MIT
 requirements: pydantic>=2.0.0, requests>=2.0.0, fastapi>=0.95.0
 
