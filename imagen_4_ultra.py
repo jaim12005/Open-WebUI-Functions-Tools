@@ -8,7 +8,7 @@ license: MIT
 requirements: pydantic>=1.8.0, aiohttp>=3.8.0
 environment_variables:
     - REPLICATE_API_TOKEN (required)
-    - IM4_IMAGE_SIZE (optional, default: "1024x1024", options: 512x512|768x768|1024x1024)
+    - IM4_IMAGE_SIZE (optional, default: "1024x1024", options: 512x512|768x768|1024x1024|2048x2048)
     - IM4_ASPECT_RATIO (optional, default: "1:1", options: 21:9|16:9|3:2|4:3|5:4|1:1|4:5|3:4|2:3|9:16|9:21)
     - IM4_OUTPUT_FORMAT (optional, default: "jpg", options: jpg|png)
     - IM4_QUALITY (optional, default: "premium", options: draft|standard|premium)
@@ -80,6 +80,7 @@ class ImageSizeEnum(str, Enum):
     size_512 = "512x512"
     size_768 = "768x768"
     size_1024 = "1024x1024"
+    size_2048 = "2048x2048"
 
 
 class OutputFormatEnum(str, Enum):
